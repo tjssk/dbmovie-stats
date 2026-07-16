@@ -65,6 +65,27 @@
 </div>
 
 <script>
+/* 带重试的 fetch：应对 Render 免费版冷启动 */
+function fetchWithRetry(url, options, maxRetries, onRetry) {
+    return new Promise(function(resolve, reject) {
+        var attempt = 0;
+        function tryOnce() {
+            fetch(url, options).then(resolve).catch(function(err) {
+                attempt++;
+                var isNetworkErr = err instanceof TypeError && err.message.includes('Failed to fetch');
+                if (attempt <= maxRetries && isNetworkErr) {
+                    var delay = attempt * 3000;
+                    if (onRetry) onRetry(attempt, maxRetries, delay);
+                    setTimeout(tryOnce, delay);
+                } else {
+                    reject(err);
+                }
+            });
+        }
+        tryOnce();
+    });
+}
+
 function startCollect() {
     var uid = document.getElementById('uid').value.trim();
     var cookie = document.getElementById('cookie').value.trim();
@@ -79,72 +100,80 @@ function startCollect() {
     btn.disabled = true;
     btn.textContent = '采集中...';
 
-    fetch('/api/collect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({uid: uid, cookie: cookie, force_refresh: force})
+    var msg = document.getElementById('progress-message');
+    document.getElementById('progress-area').classList.add('active');
+    document.getElementById('progress-done').style.display = 'none';
+    msg.textContent = '正在唤醒服务（首次访问可能需要 30-60 秒）...';
+
+    /* 先 ping health 唤醒服务（轻量 GET），再开始采集 */
+    fetchWithRetry('/api/health', {}, 10, function(attempt, max, delay) {
+        msg.textContent = '服务唤醒中，第 ' + attempt + '/' + max + ' 次重试（等待 ' + (delay/1000) + ' 秒）...';
+    }).then(function() {
+        msg.textContent = '已连接，开始采集...';
+        return fetch('/api/collect', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({uid: uid, cookie: cookie, force_refresh: force})
+        });
     }).then(function(r) { return r.json(); }).then(function(data) {
         if (data.error) {
             alert(data.error);
             btn.disabled = false;
             btn.textContent = '开始采集';
+            msg.textContent = '';
             return;
         }
-        document.getElementById('progress-area').classList.add('active');
-        document.getElementById('progress-done').style.display = 'none';
         pollStatus(uid);
     }).catch(function(err) {
-        var msg = '请求失败: ' + err;
-        if (err instanceof TypeError && err.message.includes('Failed to fetch')) {
-            msg = '网络请求失败，请检查网络连接后重试。\n如问题持续，可能是服务暂时不可用，请稍后再试。';
-        }
-        alert(msg);
+        msg.textContent = '';
+        var hint = '服务暂时不可用。\n\n可能原因：\n1. 免费版服务休眠中，请等待 1-2 分钟后重试\n2. 网络连接问题\n3. 浏览器广告拦截插件拦截了请求';
+        alert(hint);
         btn.disabled = false;
         btn.textContent = '开始采集';
     });
 }
 
 function pollStatus(uid) {
-    fetch('/api/collect/status/' + uid)
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            var bar = document.getElementById('progress-bar');
-            var msg = document.getElementById('progress-message');
-            var p = data.progress || {};
+    fetchWithRetry('/api/collect/status/' + uid, {}, 3).then(function(r){ return r.json(); }).then(function(data) {
+        var bar = document.getElementById('progress-bar');
+        var msg = document.getElementById('progress-message');
+        var p = data.progress || {};
 
-            if (data.status === 'running') {
-                if (p.phase === 'detail' && p.total) {
-                    var pct = Math.round(p.current / p.total * 100);
-                    bar.style.width = pct + '%';
-                    msg.textContent = p.message + ' (' + pct + '%)';
-                } else {
-                    bar.style.width = '5%';
-                    msg.textContent = p.message || '采集中...';
-                }
-                setTimeout(function() { pollStatus(uid); }, 1000);
-            } else if (data.status === 'done') {
-                bar.style.width = '100%';
-                msg.textContent = '';
-                var doneDiv = document.getElementById('progress-done');
-                doneDiv.style.display = 'block';
-                var result = data.result || {};
-                document.getElementById('done-message').textContent =
-                    '采集完成！共 ' + (result.total || 0) + ' 部电影，本次新采集 ' +
-                    (result.new_count || 0) + ' 部。';
-                document.getElementById('view-report-btn').href = '/report/' + uid;
-                document.getElementById('collect-btn').disabled = false;
-                document.getElementById('collect-btn').textContent = '开始采集';
-            } else if (data.status === 'error') {
-                bar.style.width = '100%';
-                bar.style.background = '#e74c3c';
-                msg.textContent = p.message || '采集失败';
-                msg.style.color = '#e74c3c';
-                document.getElementById('collect-btn').disabled = false;
-                document.getElementById('collect-btn').textContent = '开始采集';
+        if (data.status === 'running') {
+            if (p.phase === 'detail' && p.total) {
+                var pct = Math.round(p.current / p.total * 100);
+                bar.style.width = pct + '%';
+                msg.textContent = p.message + ' (' + pct + '%)';
+            } else {
+                bar.style.width = '5%';
+                msg.textContent = p.message || '采集中...';
             }
-        }).catch(function(err) {
-            console.error('轮询失败:', err);
-        });
+            setTimeout(function() { pollStatus(uid); }, 1000);
+        } else if (data.status === 'done') {
+            bar.style.width = '100%';
+            msg.textContent = '';
+            var doneDiv = document.getElementById('progress-done');
+            doneDiv.style.display = 'block';
+            var result = data.result || {};
+            document.getElementById('done-message').textContent =
+                '采集完成！共 ' + (result.total || 0) + ' 部电影，本次新采集 ' +
+                (result.new_count || 0) + ' 部。';
+            document.getElementById('view-report-btn').href = '/report/' + uid;
+            document.getElementById('collect-btn').disabled = false;
+            document.getElementById('collect-btn').textContent = '开始采集';
+        } else if (data.status === 'error') {
+            bar.style.width = '100%';
+            bar.style.background = '#e74c3c';
+            msg.textContent = p.message || '采集失败';
+            msg.style.color = '#e74c3c';
+            document.getElementById('collect-btn').disabled = false;
+            document.getElementById('collect-btn').textContent = '开始采集';
+        }
+    }).catch(function(err) {
+        console.error('轮询失败:', err);
+        /* 轮询失败时静默重试，不打扰用户 */
+        setTimeout(function() { pollStatus(uid); }, 3000);
+    });
 }
 </script>
 

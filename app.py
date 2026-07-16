@@ -91,6 +91,11 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/health')
+def health():
+    return jsonify({'status': 'ok'})
+
+
 @app.route('/api/collect', methods=['POST'])
 def start_collect():
     data = request.get_json(force=True)
